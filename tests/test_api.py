@@ -330,3 +330,237 @@ def test_compare_defaults_to_empty_facts():
         "used_facts": {"added": [], "removed": []},
         "missing_fields": {"added": [], "removed": []},
     }
+
+
+# --------------------------------------------------------------------------- #
+# POST /counterfactual
+# --------------------------------------------------------------------------- #
+
+
+def test_counterfactual_minimum_change_endpoint():
+    r = client.post(
+        "/counterfactual",
+        json={
+            "facts": {"age": 17, "country": "CN"},
+            "rules": {"eligible": {"all": [
+                {"gte": ["age", 18]},
+                {"eq": ["country", "CN"]},
+            ]}},
+            "target": "eligible",
+            "domains": {"age": [18, 30], "country": ["CN"]},
+            "max_changes": 2,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["original"]["result"] == "false"
+    assert body["minimum_changes"] == 1
+    # Sorted by field-name sequence + canonical candidate JSON: age plans only
+    # (country candidates can't help while age stays below 18).
+    keys = [
+        (c["field"], c["value"]) for p in body["plans"] for c in p["changes"]
+    ]
+    assert keys == [("age", 18), ("age", 30)]
+    for plan in body["plans"]:
+        assert plan["evaluation"]["result"] == "true"
+        assert plan["evaluation"]["result_known"] is True
+        # Full /evaluate-shaped diagnostics ride along with each plan.
+        assert "hit_paths" in plan["evaluation"]
+        assert "used_facts" in plan["evaluation"]
+    chosen = body["plans"][0]
+    assert chosen["changes"] == [{"field": "age", "value": 18}]
+    assert chosen["evaluation"]["used_facts"] == ["age", "country"]
+
+
+def test_counterfactual_no_feasible_plan():
+    r = client.post(
+        "/counterfactual",
+        json={
+            "facts": {"x": 0},
+            "target": {"eq": ["x", 1]},
+            "domains": {"x": [2, 3]},
+            "max_changes": 1,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["original"]["result"] == "false"
+    assert body["minimum_changes"] is None
+    assert body["plans"] == []
+
+
+def test_counterfactual_unknown_is_not_achievement():
+    # Changing an unrelated field cannot lift unknown to true.
+    r = client.post(
+        "/counterfactual",
+        json={
+            "facts": {},
+            "target": {"eq": ["x", 1]},
+            "domains": {"other": [1, 2, 3]},
+            "max_changes": 1,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["original"]["result"] == "unknown"
+    assert body["minimum_changes"] is None
+    assert body["plans"] == []
+
+
+def test_counterfactual_already_true():
+    r = client.post(
+        "/counterfactual",
+        json={
+            "facts": {"x": 1},
+            "target": {"eq": ["x", 1]},
+            "domains": {"x": [2]},
+            "max_changes": 1,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["minimum_changes"] == 0
+    assert len(body["plans"]) == 1
+    assert body["plans"][0]["changes"] == []
+    assert body["plans"][0]["evaluation"]["result"] == "true"
+
+
+def test_counterfactual_does_not_mutate_request_facts():
+    payload = {
+        "facts": {"x": 0},
+        "target": {"eq": ["x", 1]},
+        "domains": {"x": [1]},
+        "max_changes": 1,
+    }
+    r = client.post("/counterfactual", json=payload)
+    assert r.status_code == 200
+    assert payload["facts"] == {"x": 0}
+    assert r.json()["minimum_changes"] == 1
+
+
+def test_counterfactual_search_space_too_large_returns_422():
+    r = client.post(
+        "/counterfactual",
+        json={
+            "facts": {},
+            "target": {"eq": ["x", 1]},
+            "domains": {f"f{i:03d}": list(range(100)) for i in range(100)},
+            "max_changes": 1,
+        },
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "search_space_too_large"
+    assert "10000" in body["detail"]
+
+
+def test_counterfactual_missing_ref_returns_422():
+    r = client.post(
+        "/counterfactual",
+        json={
+            "facts": {},
+            "rules": {"a": {"ref": "ghost"}},
+            "target": "a",
+            "domains": {"x": [1]},
+            "max_changes": 1,
+        },
+    )
+    assert r.status_code == 422
+    assert r.json()["error"] == "rule_error"
+    assert "ghost" in r.json()["detail"]
+
+
+def test_counterfactual_cycle_returns_422():
+    r = client.post(
+        "/counterfactual",
+        json={
+            "facts": {},
+            "rules": {"a": {"ref": "b"}, "b": {"ref": "a"}},
+            "target": "a",
+            "domains": {"x": [1]},
+            "max_changes": 1,
+        },
+    )
+    assert r.status_code == 422
+    assert r.json()["error"] == "rule_error"
+    assert "cyclic" in r.json()["detail"]
+
+
+def test_counterfactual_static_validation_precedes_search_limit():
+    # Huge search space AND a bad rule: the static rule error must win.
+    r = client.post(
+        "/counterfactual",
+        json={
+            "facts": {},
+            "rules": {"a": {"ref": "ghost"}},
+            "target": "a",
+            "domains": {f"f{i:03d}": list(range(100)) for i in range(100)},
+            "max_changes": 1,
+        },
+    )
+    assert r.status_code == 422
+    assert r.json()["error"] == "rule_error"
+
+
+def test_counterfactual_invalid_body_returns_422():
+    # Missing required fields target/domains/max_changes.
+    r = client.post("/counterfactual", json={"facts": {}})
+    assert r.status_code == 422
+    assert r.json()["error"] == "invalid_request"
+
+    # domains must map to arrays.
+    r = client.post(
+        "/counterfactual",
+        json={
+            "target": {"eq": ["x", 1]},
+            "domains": {"x": "not-an-array"},
+            "max_changes": 1,
+        },
+    )
+    assert r.status_code == 422
+    assert r.json()["error"] == "invalid_request"
+
+    # max_changes must be a non-negative integer.
+    r = client.post(
+        "/counterfactual",
+        json={
+            "target": {"eq": ["x", 1]},
+            "domains": {"x": [1]},
+            "max_changes": -1,
+        },
+    )
+    assert r.status_code == 422
+    assert r.json()["error"] == "invalid_request"
+
+
+def test_counterfactual_response_is_stable_across_calls():
+    payload = {
+        "facts": {"a": 0, "b": 0},
+        "target": {"any": [{"gte": ["a", 1]}, {"gte": ["b", 2]}]},
+        "domains": {"a": [1], "b": [2, 20]},
+        "max_changes": 1,
+    }
+    r1 = client.post("/counterfactual", json=payload).json()
+    r2 = client.post("/counterfactual", json=payload).json()
+    assert r1 == r2
+    keys = [
+        (c["field"], c["value"]) for p in r1["plans"] for c in p["changes"]
+    ]
+    assert keys == [("a", 1), ("b", 20), ("b", 2)]
+
+
+def test_counterfactual_two_field_plan_changes_sorted():
+    r = client.post(
+        "/counterfactual",
+        json={
+            "facts": {},
+            "target": {"all": [{"eq": ["b", 2]}, {"eq": ["a", 1]}]},
+            "domains": {"a": [1], "b": [2]},
+            "max_changes": 2,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["minimum_changes"] == 2
+    # Field names inside a plan are sorted regardless of rule traversal order.
+    assert [c["field"] for c in body["plans"][0]["changes"]] == ["a", "b"]

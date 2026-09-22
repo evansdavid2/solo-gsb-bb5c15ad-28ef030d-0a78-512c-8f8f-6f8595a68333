@@ -406,3 +406,182 @@ def test_diff_result_changed_follows_baseline_traversal_order():
         "$target/all[1]",
         "$target",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Counterfactual minimum-change search
+# --------------------------------------------------------------------------- #
+
+
+def test_counterfactual_finds_minimum_change():
+    target = {"all": [{"gte": ["age", 18]}, {"eq": ["country", "CN"]}]}
+    engine.analyze({}, target)
+    out = engine.counterfactual(
+        {},
+        {"age": 17, "country": "CN"},
+        target,
+        {"age": [18, 30], "country": ["CN", "JP"]},
+        max_changes=2,
+    )
+    assert out["original"]["result"] == "false"
+    assert out["minimum_changes"] == 1
+    # Raising age to either candidate while country already matches yields the
+    # two one-change plans; country candidates alone can't help (age stays 17).
+    assert [c["field"] for p in out["plans"] for c in p["changes"]] == [
+        "age",
+        "age",
+    ]
+    # Plans sorted by field-name sequence + canonical candidate JSON.
+    age_values = [p["changes"][0]["value"] for p in out["plans"]]
+    assert age_values == [18, 30]
+    for plan in out["plans"]:
+        assert plan["evaluation"]["result"] == "true"
+
+
+def test_counterfactual_already_true_is_zero_changes():
+    target = {"eq": ["x", 1]}
+    engine.analyze({}, target)
+    out = engine.counterfactual({}, {"x": 1}, target, {"x": [2]}, max_changes=1)
+    assert out["minimum_changes"] == 0
+    assert out["plans"] == [{"changes": [], "evaluation": out["original"]}]
+
+
+def test_counterfactual_unknown_does_not_count_as_success():
+    # Adding some irrelevant field leaves the conjunction unknown; supplying
+    # the missing country makes it true with exactly one change.
+    target = {"all": [{"eq": ["age", 18]}, {"eq": ["country", "CN"]}]}
+    engine.analyze({}, target)
+    out = engine.counterfactual(
+        {},
+        {"age": 18},
+        target,
+        {"other": [1, 2], "country": ["CN"]},
+        max_changes=2,
+    )
+    assert out["minimum_changes"] == 1
+    assert out["plans"] == [
+        {"changes": [{"field": "country", "value": "CN"}], "evaluation": out["plans"][0]["evaluation"]}
+    ]
+    assert out["plans"][0]["evaluation"]["missing_fields"] == []
+
+
+def test_counterfactual_no_feasible_plan_returns_null():
+    target = {"eq": ["x", 1]}
+    engine.analyze({}, target)
+    out = engine.counterfactual(
+        {}, {"x": 0}, target, {"x": [2, 3], "y": [1]}, max_changes=2
+    )
+    assert out["minimum_changes"] is None
+    assert out["plans"] == []
+    assert out["original"]["result"] == "false"
+
+
+def test_counterfactual_max_changes_bounds_the_search():
+    target = {"all": [{"eq": ["a", 1]}, {"eq": ["b", 2]}]}
+    engine.analyze({}, target)
+    out = engine.counterfactual(
+        {}, {}, target, {"a": [1], "b": [2]}, max_changes=1
+    )
+    # One change alone never satisfies the conjunction; two would.
+    assert out["minimum_changes"] is None
+    assert out["plans"] == []
+    out = engine.counterfactual(
+        {}, {}, target, {"a": [1], "b": [2]}, max_changes=2
+    )
+    assert out["minimum_changes"] == 2
+    assert [c["field"] for c in out["plans"][0]["changes"]] == ["a", "b"]
+
+
+def test_counterfactual_does_not_mutate_facts():
+    target = {"eq": ["x", 1]}
+    engine.analyze({}, target)
+    facts = {"x": 0}
+    engine.counterfactual({}, facts, target, {"x": [1]}, max_changes=1)
+    assert facts == {"x": 0}
+
+
+def test_counterfactual_current_value_is_not_a_change():
+    # The only candidate equals the current value: with the rule false there
+    # is no feasible plan; current-value assignments never produce a change.
+    target = {"eq": ["x", 1]}
+    engine.analyze({}, target)
+    out = engine.counterfactual({}, {"x": 0}, target, {"x": [0]}, max_changes=1)
+    assert out["minimum_changes"] is None
+    assert out["plans"] == []
+
+
+def test_counterfactual_dedupes_canonically_equivalent_candidates():
+    # Duplicate candidates (JSON-equal, different key order) collapse to one.
+    target = {"eq": ["o", {"k": 1}]}
+    engine.analyze({}, target)
+    out = engine.counterfactual(
+        {},
+        {"o": 0},
+        target,
+        {"o": [{"k": 1}, {"k": 1, "k2": 0}, {"k": 1}]},
+        max_changes=1,
+    )
+    assert out["minimum_changes"] == 1
+    assert len(out["plans"]) == 1
+    assert out["plans"][0]["changes"][0]["value"] == {"k": 1}
+
+
+def test_counterfactual_plans_sorted_across_fields_and_values():
+    # Two fields, two true-making values each: four one-change plans ordered by
+    # the canonical "field sequence + values" key, so all 'a' plans precede b.
+    target = {"any": [{"gte": ["a", 1]}, {"gte": ["b", 2]}]}
+    engine.analyze({}, target)
+    out = engine.counterfactual(
+        {},
+        {"a": 0, "b": 0},
+        target,
+        {"a": [1, 10], "b": [2, 20]},
+        max_changes=1,
+    )
+    assert out["minimum_changes"] == 1
+    keys = [
+        (p["changes"][0]["field"], p["changes"][0]["value"]) for p in out["plans"]
+    ]
+    # Canonical-JSON string order, not numeric: 10 precedes 1 because
+    # '[["a",10]]' < '[["a",1]]' at the '0' vs ']' divergence; fields dominate
+    # the prefix, so every 'a' plan precedes every 'b' plan.
+    assert keys == [("a", 10), ("a", 1), ("b", 20), ("b", 2)]
+
+
+def test_counterfactual_null_candidate_can_achieve_true():
+    target = {"eq": ["x", None]}
+    engine.analyze({}, target)
+    out = engine.counterfactual({}, {"x": 0}, target, {"x": [None]}, max_changes=1)
+    assert out["minimum_changes"] == 1
+    assert out["plans"][0]["changes"][0]["value"] is None
+
+
+def test_counterfactual_empty_domain_field_is_ignored():
+    target = {"eq": ["x", 1]}
+    engine.analyze({}, target)
+    out = engine.counterfactual(
+        {}, {"x": 0}, target, {"x": [1], "y": []}, max_changes=2
+    )
+    assert out["minimum_changes"] == 1
+    assert len(out["plans"]) == 1
+
+
+def test_counterfactual_search_limit_boundary_allowed_and_exceeded():
+    target = {"eq": ["x", 1]}
+    engine.analyze({}, target)
+    # 100 fields x 100 values = exactly 10_000 one-change plans + k=0: 10_001
+    # combinations -> rejected.
+    domains = {f"f{i:03d}": list(range(100)) for i in range(100)}
+    with pytest.raises(engine.SearchLimitError):
+        engine.counterfactual({}, {}, target, domains, max_changes=1)
+
+    # 100 x 99 + 1 = 9_901 combinations: within the limit, fully searched.
+    smaller = {f"f{i:03d}": list(range(99)) for i in range(100)}
+    out = engine.counterfactual({}, {}, target, smaller, max_changes=1)
+    assert out["minimum_changes"] is None
+    assert out["plans"] == []
+
+
+def test_canonical_json_orders_object_keys():
+    assert engine.canonical_json({"b": 1, "a": 2}) == '{"a":2,"b":1}'
+    assert engine.canonical_json({"a": 2, "b": 1}) == '{"a":2,"b":1}'

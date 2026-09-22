@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -27,6 +27,17 @@ class CompareRequest(BaseModel):
     target: Any
 
 
+class CounterfactualRequest(BaseModel):
+    facts: Dict[str, Any] = Field(default_factory=dict)
+    rules: Optional[Dict[str, Any]] = None
+    # Same inline-node-or-name semantics as EvaluateRequest.target.
+    target: Any
+    # Field name -> candidate JSON values the field may be changed to.
+    domains: Dict[str, List[Any]]
+    # Upper bound on changed fields in any single plan.
+    max_changes: int = Field(ge=0)
+
+
 app = FastAPI(
     title="Compliance Rule Evaluation API",
     version="1.0.0",
@@ -42,6 +53,16 @@ async def rule_error_handler(request: Request, exc: engine.RuleError) -> JSONRes
     return JSONResponse(
         status_code=422,
         content={"error": "rule_error", "detail": str(exc)},
+    )
+
+
+@app.exception_handler(engine.SearchLimitError)
+async def search_limit_handler(
+    request: Request, exc: engine.SearchLimitError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"error": "search_space_too_large", "detail": str(exc)},
     )
 
 
@@ -89,3 +110,18 @@ def compare(req: CompareRequest) -> Dict[str, Any]:
         "result_changed": baseline["result"] != candidate["result"],
         "diff": engine.diff_evaluations(baseline, candidate),
     }
+
+
+@app.post("/counterfactual")
+def counterfactual(req: CounterfactualRequest) -> Dict[str, Any]:
+    """Find minimum field changes (from domains) that make the target true."""
+    # Static checks first, identical to /evaluate and /compare: malformed
+    # nodes, missing refs and cycles reject the request before any search.
+    engine.analyze(req.rules, req.target)
+    return engine.counterfactual(
+        req.rules,
+        req.facts,
+        req.target,
+        req.domains,
+        req.max_changes,
+    )

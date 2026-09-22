@@ -25,10 +25,15 @@ Evaluation happens in two stages:
    the fact fields that were referenced but not provided.
 3. :func:`diff_evaluations` aligns two evaluations of the same rule tree by
    path, powering the ``/compare`` endpoint.
+4. :func:`counterfactual` searches for the minimum field changes (each drawn
+   from per-field candidate domains) that make the target evaluate true,
+   powering the ``/counterfactual`` endpoint.
 """
 
 from __future__ import annotations
 
+import itertools
+import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -43,9 +48,29 @@ LOGIC_OPS = ("all", "any", "not", "ref")
 COMPARE_OPS = ("eq", "ne", "gt", "gte", "lt", "lte")
 KNOWN_OPS = LOGIC_OPS + COMPARE_OPS
 
+# Counterfactual search is exhaustive; the request is rejected once its
+# candidate-change space grows past this many combinations.
+SEARCH_LIMIT = 10_000
+
 
 class RuleError(ValueError):
     """A static rule error: malformed node, missing ref or cycle."""
+
+
+class SearchLimitError(ValueError):
+    """The counterfactual change-space exceeds :data:`SEARCH_LIMIT`."""
+
+
+def canonical_json(value: Any) -> str:
+    """Serialize ``value`` to canonical JSON text.
+
+    Object keys are sorted, so JSON-equal documents share one text regardless
+    of input key order. Used both to recognise "the value is unchanged" and to
+    stably sort/deduplicate counterfactual plans.
+    """
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -500,3 +525,127 @@ def diff_evaluations(
             baseline["missing_fields"], candidate["missing_fields"]
         ),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Counterfactual minimum-change search (used by POST /counterfactual)
+# --------------------------------------------------------------------------- #
+
+
+def counterfactual(
+    rules: dict[str, Any] | None,
+    facts: dict[str, Any] | None,
+    target: Any,
+    domains: dict[str, list[Any]],
+    max_changes: int,
+) -> dict[str, Any]:
+    """Find the minimum field changes that make the target evaluate true.
+
+    Static analysis must already have passed (see :func:`analyze`). Each
+    changed field may only take values from ``domains[field]``; the original
+    ``facts`` are never mutated. A plan whose result stays unknown (or false)
+    is rejected -- only a definite ``true`` counts.
+
+    Plans are enumerated by increasing number of changed fields, so the first
+    level with any plan yields the global minimum. Within a level the order is
+    deterministic: field-name subsets lexicographically, then candidate values
+    in request order. Raises :class:`SearchLimitError` when the (bounded)
+    change space exceeds :data:`SEARCH_LIMIT`.
+    """
+    rules = rules or {}
+    facts = facts or {}
+
+    # Baseline evaluation of the untouched facts (also the result returned to
+    # the caller as the "original" outcome).
+    original = evaluate(rules, facts, target)
+
+    # Per field: distinct candidate values (JSON canonical order dedup), with
+    # the current value dropped -- assigning it back is not a change. Steps
+    # stay keyed by field name, which makes every generated plan determinable
+    # without relying on dict iteration order.
+    options: dict[str, list[Any]] = {}
+    for name in sorted(domains):
+        current = canonical_json(facts[name]) if name in facts else None
+        seen: set[str] = set()
+        values: list[Any] = []
+        for candidate in domains[name]:
+            key = canonical_json(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            if key == current:
+                continue  # no-op: the field already has this value
+            values.append(candidate)
+        if values:
+            options[name] = values
+
+    names = list(options)
+    k_cap = min(max_changes, len(names))
+
+    # Count exact-k change combinations (k == 0 is the single empty plan):
+    # 0/1 knapsack-style product over each field's candidate values.
+    counts = [1]
+    for values in options.values():
+        counts.append(0)
+        for k in range(len(counts) - 1, 0, -1):
+            counts[k] += counts[k - 1] * len(values)
+    total = sum(counts[: k_cap + 1])
+    if total > SEARCH_LIMIT:
+        raise SearchLimitError(
+            f"counterfactual search space has {total} combinations "
+            f"(limit {SEARCH_LIMIT}); narrow 'domains' or lower 'max_changes'"
+        )
+
+    # Already true with zero changes: the sole minimum plan is the empty one.
+    if original["result"] == "true":
+        return {
+            "original": original,
+            "minimum_changes": 0,
+            "plans": [{"changes": [], "evaluation": original}],
+        }
+
+    for k in range(1, k_cap + 1):
+        plans: list[dict[str, Any]] = []
+        seen_plans: set[str] = set()
+        # sorted(names) iteration above fixes subset/product enumeration order.
+        for chosen in itertools.combinations(names, k):
+            value_lists = (options[name] for name in chosen)
+            for picked in itertools.product(*value_lists):
+                # Build candidate facts on a copy; the request facts stay
+                # untouched for both us and the API caller.
+                candidate_facts = dict(facts)
+                candidate_facts.update(dict(zip(chosen, picked)))
+                evaluation = evaluate(rules, candidate_facts, target)
+                if evaluation["result"] != "true":
+                    continue  # false or unknown does not achieve the goal
+                changes = [
+                    {"field": name, "value": value}
+                    for name, value in zip(chosen, picked)
+                ]
+                plan_key = canonical_json(
+                    [[name, value] for name, value in zip(chosen, picked)]
+                )
+                if plan_key in seen_plans:
+                    continue
+                seen_plans.add(plan_key)
+                plans.append({"changes": changes, "evaluation": evaluation})
+
+        if plans:
+            # Enumeration order is already canonical, but sort/dedupe by the
+            # "field sequence + canonical candidate JSON" key defensively so
+            # output stability does not depend on traversal internals.
+            plans.sort(
+                key=lambda plan: canonical_json(
+                    [
+                        [change["field"], change["value"]]
+                        for change in plan["changes"]
+                    ]
+                )
+            )
+            return {
+                "original": original,
+                "minimum_changes": k,
+                "plans": plans,
+            }
+
+    return {"original": original, "minimum_changes": None, "plans": []}
