@@ -6,6 +6,7 @@
 - 求值前先解析全部引用依赖：**缺失引用**与**循环引用**直接拒绝（422）
 - 求值采用 Kleene 三值逻辑，支持短路；即使短路，也会返回**实际读取的事实、未提供字段、命中的规则路径**
 - `POST /compare` 用同一 `rules`/`target` 对两组事实各求值一次，按路径对齐两侧诊断，报告新增/移除/结果翻转的命中路径与事实差异
+- `POST /counterfactual` 在不修改原事实的前提下，按候选值域搜索让目标变为 `true` 的**最少字段变更**方案；搜索组合超过 10000 直接拒绝（422），不做无界计算
 - 同一请求输出稳定：数组型规则按给定顺序求值，集合类结果排序，路径确定
 - 依赖安装与初始化全部在镜像构建阶段完成，单条命令启动；**不依赖任何外部账号或付费服务**
 
@@ -21,6 +22,7 @@ docker compose up --build
 
 - 接口地址：`POST http://localhost:8000/evaluate`
 - 对比接口：`POST http://localhost:8000/compare`
+- 反事实接口：`POST http://localhost:8000/counterfactual`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式文档：`http://localhost:8000/docs`（Swagger UI）
 
@@ -191,7 +193,91 @@ curl -s -X POST http://localhost:8000/compare \
 
 ---
 
-## 4. 规则语法
+## 4. `POST /counterfactual`：最小反事实变更搜索
+
+在**不修改原始 `facts`** 的前提下，搜索让 `target` 结果变为 `"true"` 的**最少字段变更**方案：每个被变更的字段只能取 `domains` 中列出的候选值，且每个字段在一次方案中至多变更一次。
+
+### 请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `facts` | object | 否（默认 `{}`） | 原始事实字典；搜索过程不修改它 |
+| `rules` | object | 否 | 与 `/evaluate` 相同的命名规则映射 |
+| `target` | object 或 string | 是 | 与 `/evaluate` 相同 |
+| `domains` | object | 是 | `{字段: [候选 JSON 值, ...]}`；变更只能取这些值 |
+| `max_changes` | integer ≥ 0 | 是 | 允许变更的最大字段数 |
+
+处理顺序：先做与 `/evaluate` 完全相同的静态校验（结构、引用、查环，失败返回 422 `rule_error`），再校验 `domains`/`max_changes`，最后按变更数 k = 0, 1, …, `max_changes` 逐层搜索。
+
+### 搜索语义
+
+- 第 k 层枚举「k 个字段的子集 × 各字段候选值的笛卡尔积」，对每个组合在 `facts` 的**合并副本**上求值（原字典不被修改）
+- 只有结果为 `"true"` 才算达成；`"unknown"`（字段仍缺失、类型不可比等）**不算**
+- 某一层找到方案即停止，因此返回的 `plans` 全部是**全局最小变更数**的方案
+- 候选值先按规范 JSON（`json.dumps`：键排序、紧凑分隔符）去重；方案按「变更字段名序列 + 候选值规范 JSON」排序并去重，输出稳定
+- 原始结果已为 `"true"` 时，最小变更数为 0，唯一方案的 `changes` 为空对象
+
+### 组合数上限（10000）
+
+搜索组合数 = 各层「字段子集 × 候选值组合」之和（含 k=0 的 1 次求值）。若超过 **10000**，在任何求值之前返回 422：
+
+```json
+{"error": "search_space_exceeded", "detail": "counterfactual search space exceeds the limit of 10000 combinations; narrow 'domains' or lower 'max_changes'"}
+```
+
+缩小 `domains` 或降低 `max_changes` 即可通过。
+
+### 响应体（HTTP 200）
+
+| 字段 | 说明 |
+|---|---|
+| `original_result` | 原始 `facts` 下的判定结果（`"true"` / `"false"` / `"unknown"`） |
+| `minimum_changes` | 达成 `"true"` 的最少变更字段数；无可行方案时为 `null` |
+| `plans` | 最小变更方案列表（已排序去重）；无可行方案时为 `[]` |
+
+`plans` 中每项：
+
+- `changes`：`{字段: 新值}`，需要套用的变更
+- `evaluation`：套用变更后的完整 `/evaluate` 诊断（`result` 必为 `"true"`，另含 `used_facts` / `missing_fields` / `hit_paths`）
+
+### 最小示例
+
+```bash
+curl -s -X POST http://localhost:8000/counterfactual \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "facts": {"age": 20},
+    "rules": {"eligible": {"all": [{"gte": ["age", 18]}, {"eq": ["country", "CN"]}]}},
+    "target": "eligible",
+    "domains": {"age": [20, 99], "country": ["CN", "US"]},
+    "max_changes": 2
+  }'
+```
+
+响应（`hit_paths` 从略）：
+
+```json
+{
+  "original_result": "unknown",
+  "minimum_changes": 1,
+  "plans": [
+    {
+      "changes": {"country": "CN"},
+      "evaluation": {"result": "true", "result_known": true, "used_facts": ["age", "country"], "missing_fields": [], "hit_paths": ["..."]}
+    }
+  ]
+}
+```
+
+无可行方案时：
+
+```json
+{"original_result": "false", "minimum_changes": null, "plans": []}
+```
+
+---
+
+## 5. 规则语法
 
 每个规则节点是一个**只含一个操作符键**的 JSON 对象：
 
@@ -224,7 +310,7 @@ curl -s -X POST http://localhost:8000/compare \
 
 ---
 
-## 5. 三值逻辑真值表（Kleene）
+## 6. 三值逻辑真值表（Kleene）
 
 **NOT**
 
@@ -268,7 +354,7 @@ curl -s -X POST http://localhost:8000/compare \
 
 ---
 
-## 6. 处理流程
+## 7. 处理流程
 
 1. **结构校验**：递归校验 `rules` 全部节点与 `target`
 2. **引用解析**：收集所有 `ref`（含字符串形式 target），任何被引用但未定义的规则名 → 422
@@ -277,9 +363,11 @@ curl -s -X POST http://localhost:8000/compare \
 
 循环检测覆盖整个 `rules` 图（含当前 target 不可达的规则），尽早暴露坏配置。
 
+`POST /counterfactual` 复用上述 1–3 步静态校验，通过后先校验 `domains` 与组合数上限（>10000 → 422），再逐层做最小变更搜索。
+
 ---
 
-## 7. 本地开发（不使用 Docker）
+## 8. 本地开发（不使用 Docker）
 
 需要 Python 3.11+：
 
@@ -292,18 +380,18 @@ uvicorn app.main:app --reload --port 8000   # 启动
 pytest -q                                    # 运行测试
 ```
 
-测试覆盖：六个比较符、Kleene 真值表、短路诊断、缺失引用/自环/直接环/间接环、DAG 菱形复用、结构非法节点、端到端 HTTP 行为，以及 `/compare` 的路径对齐（新增/移除/结果翻转）、短路边界移动、事实与缺失字段集合差异和 422 拒绝（共 61 个用例）。
+测试覆盖：六个比较符、Kleene 真值表、短路诊断、缺失引用/自环/直接环/间接环、DAG 菱形复用、结构非法节点、端到端 HTTP 行为，`/compare` 的路径对齐（新增/移除/结果翻转）、短路边界移动、事实与缺失字段集合差异和 422 拒绝，以及 `/counterfactual` 的最小变更搜索、全局最小方案筛选、排序去重、unknown 不计入、原事实不可变、组合数上限与 422 拒绝（共 80 个用例）。
 
 ---
 
-## 8. 项目结构
+## 9. 项目结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由（/evaluate、/compare）、请求模型、错误处理
-│   └── engine.py      # 规则语法、依赖解析/查环、三值求值/诊断、双次求值对齐
+│   ├── main.py        # FastAPI 路由（/evaluate、/compare、/counterfactual）、请求模型、错误处理
+│   └── engine.py      # 规则语法、依赖解析/查环、三值求值/诊断、双次求值对齐、反事实最小变更搜索
 ├── tests/
 │   ├── test_engine.py
 │   └── test_api.py
@@ -314,7 +402,7 @@ pytest -q                                    # 运行测试
 └── README.md
 ```
 
-## 9. 镜像与部署说明
+## 10. 镜像与部署说明
 
 - 基础镜像：`python:3.11-slim`；以非 root 用户运行
 - `pip install` 与代码拷贝均在构建期完成，容器启动只运行 `uvicorn`，无启动期下载、无数据库、无消息队列、无外部账号或付费服务

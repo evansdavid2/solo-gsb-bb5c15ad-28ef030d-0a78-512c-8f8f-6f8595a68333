@@ -406,3 +406,103 @@ def test_diff_result_changed_follows_baseline_traversal_order():
         "$target/all[1]",
         "$target",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Counterfactual search (POST /counterfactual)
+# --------------------------------------------------------------------------- #
+
+
+def test_counterfactual_finds_single_field_minimum():
+    target = {"all": [{"gte": ["age", 18]}, {"eq": ["country", "CN"]}]}
+    engine.analyze({}, target)
+    out = engine.find_counterfactuals(
+        {}, {"age": 20}, target, {"country": ["CN", "US"]}, 2
+    )
+    assert out["original_result"] == "unknown"
+    assert out["minimum_changes"] == 1
+    assert len(out["plans"]) == 1
+    assert out["plans"][0]["changes"] == {"country": "CN"}
+    assert out["plans"][0]["evaluation"]["result"] == "true"
+
+
+def test_counterfactual_does_not_mutate_facts():
+    facts = {"a": 0}
+    target = {"eq": ["a", 1]}
+    engine.analyze({}, target)
+    out = engine.find_counterfactuals({}, facts, target, {"a": [1, 2]}, 1)
+    assert facts == {"a": 0}
+    assert out["minimum_changes"] == 1
+    assert out["plans"][0]["changes"] == {"a": 1}
+
+
+def test_counterfactual_unknown_never_counts_as_achieved():
+    # "lots" is incomparable with 18 (unknown); only the numeric value works.
+    target = {"gt": ["age", 18]}
+    engine.analyze({}, target)
+    out = engine.find_counterfactuals(
+        {}, {"age": 10}, target, {"age": ["lots", 20]}, 1
+    )
+    assert out["minimum_changes"] == 1
+    assert [p["changes"] for p in out["plans"]] == [{"age": 20}]
+
+
+def test_counterfactual_each_field_changes_at_most_once():
+    # Reaching the goal needs both fields; one field cannot be changed twice.
+    target = {"all": [{"eq": ["a", 1]}, {"eq": ["b", 2]}]}
+    engine.analyze({}, target)
+    out = engine.find_counterfactuals(
+        {}, {"a": 0, "b": 0}, target, {"a": [1], "b": [2]}, 2
+    )
+    assert out["minimum_changes"] == 2
+    assert [p["changes"] for p in out["plans"]] == [{"a": 1, "b": 2}]
+
+
+def test_counterfactual_plans_sorted_and_deduped():
+    # Duplicate domain values collapse; plans sort by field names, then by
+    # canonical value JSON ("10" < "2" lexicographically).
+    target = {"any": [{"eq": ["x", 2]}, {"eq": ["x", 10]}]}
+    engine.analyze({}, target)
+    out = engine.find_counterfactuals(
+        {}, {"x": 0}, target, {"x": [2, 10, 2, 10]}, 1
+    )
+    assert out["minimum_changes"] == 1
+    assert [p["changes"] for p in out["plans"]] == [{"x": 10}, {"x": 2}]
+
+
+def test_counterfactual_infeasible_returns_null_minimum():
+    target = {"eq": ["a", 1]}
+    engine.analyze({}, target)
+    out = engine.find_counterfactuals({}, {"a": 0}, target, {"a": [2, 3]}, 3)
+    assert out["original_result"] == "false"
+    assert out["minimum_changes"] is None
+    assert out["plans"] == []
+
+
+def test_counterfactual_combination_count():
+    # Sum of elementary symmetric polynomials of the domain sizes, k = 0..max_k.
+    assert engine._count_combinations([2, 3], 2, 10**9) == 1 + 2 + 3 + 6
+    assert engine._count_combinations([5] * 6, 3, 10**9) == 1 + 30 + 375 + 2500
+    # Capped so oversized requests stay cheap to reject.
+    assert engine._count_combinations([5] * 6, 6, 10_001) == 10_001
+
+
+def test_counterfactual_search_space_exceeded_raises():
+    domains = {f"f{i}": [1, 2, 3, 4, 5] for i in range(6)}
+    target = {"eq": ["f0", 1]}
+    engine.analyze({}, target)
+    with pytest.raises(engine.SearchSpaceExceeded, match="exceeds the limit"):
+        engine.find_counterfactuals({}, {}, target, domains, 6)
+
+
+def test_counterfactual_domain_validation():
+    target = {"eq": ["a", 1]}
+    engine.analyze({}, target)
+    with pytest.raises(engine.RuleError, match="'domains'"):
+        engine.find_counterfactuals({}, {}, target, "nope", 1)
+    with pytest.raises(engine.RuleError, match="array of candidate"):
+        engine.find_counterfactuals({}, {}, target, {"a": 1}, 1)
+    with pytest.raises(engine.RuleError, match="non-empty strings"):
+        engine.find_counterfactuals({}, {}, target, {"": [1]}, 1)
+    with pytest.raises(engine.RuleError, match="max_changes"):
+        engine.find_counterfactuals({}, {}, target, {"a": [1]}, -1)

@@ -25,10 +25,15 @@ Evaluation happens in two stages:
    the fact fields that were referenced but not provided.
 3. :func:`diff_evaluations` aligns two evaluations of the same rule tree by
    path, powering the ``/compare`` endpoint.
+4. :func:`find_counterfactuals` searches candidate-value domains for the
+   smallest fact overrides that make the target evaluate to ``true``,
+   powering the ``/counterfactual`` endpoint.
 """
 
 from __future__ import annotations
 
+import itertools
+import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -46,6 +51,10 @@ KNOWN_OPS = LOGIC_OPS + COMPARE_OPS
 
 class RuleError(ValueError):
     """A static rule error: malformed node, missing ref or cycle."""
+
+
+class SearchSpaceExceeded(ValueError):
+    """The counterfactual search space exceeds the configured safety limit."""
 
 
 # --------------------------------------------------------------------------- #
@@ -499,4 +508,152 @@ def diff_evaluations(
         "missing_fields": _set_diff(
             baseline["missing_fields"], candidate["missing_fields"]
         ),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Counterfactual search (used by POST /counterfactual)
+# --------------------------------------------------------------------------- #
+
+# Hard cap on (field-subset x value-assignment) combinations per request, so a
+# wide 'domains' map cannot trigger unbounded enumeration.
+MAX_COUNTERFACTUAL_COMBINATIONS = 10_000
+
+
+def validate_domains(domains: Any) -> None:
+    """Validate the field -> candidate-values map before searching."""
+    if not isinstance(domains, dict):
+        raise RuleError(
+            "'domains' must be an object mapping fact fields to arrays of "
+            "candidate values"
+        )
+    for field_name, values in domains.items():
+        if not isinstance(field_name, str) or not field_name:
+            raise RuleError(
+                f"domain field names must be non-empty strings, got {field_name!r}"
+            )
+        if not isinstance(values, list):
+            raise RuleError(
+                f"'domains[{field_name}]' must be an array of candidate "
+                f"values, got {type(values).__name__}"
+            )
+
+
+def _canonical_json(value: Any) -> str:
+    """Canonical JSON encoding of a candidate value (dedupe/sort key)."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _dedupe_candidates(values: list[Any]) -> list[Any]:
+    """Drop duplicate candidate values, keeping first-occurrence order."""
+    seen: set[str] = set()
+    unique: list[Any] = []
+    for value in values:
+        key = _canonical_json(value)
+        if key not in seen:
+            seen.add(key)
+            unique.append(value)
+    return unique
+
+
+def _count_combinations(sizes: list[int], max_k: int, cap: int) -> int:
+    """Number of (field subset, value assignment) combos for k = 0..max_k.
+
+    This is the sum of the elementary symmetric polynomials of the domain
+    sizes, computed by DP and capped at ``cap`` so that even absurd requests
+    stay cheap to reject. k = 0 contributes one combination (evaluating the
+    untouched facts).
+    """
+    dp = [0] * (max_k + 1)
+    dp[0] = 1
+    for size in sizes:
+        for j in range(max_k, 0, -1):
+            dp[j] = min(cap, dp[j] + dp[j - 1] * size)
+    return min(cap, sum(dp))
+
+
+def _plan_key(changes: dict[str, Any]) -> tuple:
+    """Stable sort/dedupe key: changed field names + canonical value JSON."""
+    fields = sorted(changes)
+    return tuple(fields), tuple(_canonical_json(changes[name]) for name in fields)
+
+
+def find_counterfactuals(
+    rules: dict[str, Any] | None,
+    facts: dict[str, Any] | None,
+    target: Any,
+    domains: dict[str, Any],
+    max_changes: int,
+) -> dict[str, Any]:
+    """Search for the smallest fact overrides that make ``target`` true.
+
+    Static analysis (:func:`analyze`) must already have passed. ``facts`` is
+    never mutated; every candidate is evaluated against a merged copy. Each
+    changed field takes exactly one value from ``domains[field]`` and may be
+    changed at most once per plan. A result of ``"unknown"`` never counts as
+    achieved. Only plans using the globally minimal number of changed fields
+    are returned, deduplicated and sorted by (changed field names, canonical
+    value JSON).
+    """
+    validate_domains(domains)
+    if not isinstance(max_changes, int) or max_changes < 0:
+        raise RuleError(
+            f"'max_changes' must be a non-negative integer, got {max_changes!r}"
+        )
+    rules = rules or {}
+    facts = facts or {}
+
+    candidates = {
+        name: _dedupe_candidates(values) for name, values in domains.items()
+    }
+    # Fields with no candidate values can never take part in a change.
+    fields = sorted(name for name, values in candidates.items() if values)
+    sizes = [len(candidates[name]) for name in fields]
+
+    k_max = min(max_changes, len(fields))
+    total = _count_combinations(sizes, k_max, MAX_COUNTERFACTUAL_COMBINATIONS + 1)
+    if total > MAX_COUNTERFACTUAL_COMBINATIONS:
+        raise SearchSpaceExceeded(
+            f"counterfactual search space exceeds the limit of "
+            f"{MAX_COUNTERFACTUAL_COMBINATIONS} combinations; narrow "
+            f"'domains' or lower 'max_changes'"
+        )
+
+    original = evaluate(rules, facts, target)
+    if original["result"] == "true":
+        # Already true: the empty change set is the unique minimal plan.
+        return {
+            "original_result": "true",
+            "minimum_changes": 0,
+            "plans": [{"changes": {}, "evaluation": original}],
+        }
+
+    # Level by level: the first level with any solution is the global minimum.
+    for k in range(1, k_max + 1):
+        plans: list[dict[str, Any]] = []
+        seen: set[tuple] = set()
+        for field_subset in itertools.combinations(fields, k):
+            pools = [candidates[name] for name in field_subset]
+            for values in itertools.product(*pools):
+                changes = dict(zip(field_subset, values))
+                outcome = evaluate(rules, {**facts, **changes}, target)
+                if outcome["result"] != "true":
+                    continue
+                key = _plan_key(changes)
+                if key in seen:
+                    continue
+                seen.add(key)
+                plans.append({"changes": changes, "evaluation": outcome})
+        if plans:
+            plans.sort(key=lambda plan: _plan_key(plan["changes"]))
+            return {
+                "original_result": original["result"],
+                "minimum_changes": k,
+                "plans": plans,
+            }
+
+    return {
+        "original_result": original["result"],
+        "minimum_changes": None,
+        "plans": [],
     }
